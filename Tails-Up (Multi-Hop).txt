@@ -1,0 +1,230 @@
+## Tails-Up (Multi-Hop)
+## Instructions, Go to tailcale and create a script for a linux cli connection and enable advertise exit nodes then go to your VPS server and paste the script to install tailscale and connect it to your systmem. Then go to your vpn provider of choice and download a wireguard config and move it to your servers "/etc/wireguard" folder if the directory dosent exits make it then move it, Then run this script to have the VPS route your traffic acting as your own private VPN with DNS over TLS for encryption and a second hop to your specified wireguard exit.
+
+
+sudo bash <<'EOF'
+set -e
+
+echo "=== Installing packages ==="
+dnf install -y wireguard-tools firewalld tcpdump
+
+test -f /etc/wireguard/proton.conf || {
+    echo "ERROR: Put your Proton WireGuard config at /etc/wireguard/proton.conf first."
+    exit 1
+}
+
+chmod 600 /etc/wireguard/proton.conf
+
+echo "=== Enable forwarding ==="
+cat >/etc/sysctl.d/99-tailscale.conf <<'SYSCTL'
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+SYSCTL
+sysctl -p /etc/sysctl.d/99-tailscale.conf
+
+echo "=== Configure firewall ==="
+systemctl enable --now firewalld
+
+ETHZONE="$(firewall-cmd --get-zone-of-interface=eth0 2>/dev/null || true)"
+[ -z "$ETHZONE" ] && ETHZONE=public
+
+firewall-cmd --permanent --zone=trusted --add-interface=tailscale0 || true
+firewall-cmd --permanent --zone="$ETHZONE" --add-masquerade
+firewall-cmd --permanent --zone="$ETHZONE" --add-port=41641/udp
+firewall-cmd --reload
+
+echo "=== Prepare Proton config for policy routing ==="
+
+# Remove anything that would let wg-quick replace the Linode default route.
+sed -i '/^[[:space:]]*Table[[:space:]]*=/d' /etc/wireguard/proton.conf
+sed -i '/^[[:space:]]*DNS[[:space:]]*=/d' /etc/wireguard/proton.conf
+sed -i '/^\[Interface\]/a Table = off' /etc/wireguard/proton.conf
+
+echo "=== Clean up previous Proton state ==="
+systemctl stop tailscale-proton-route.service 2>/dev/null || true
+systemctl stop wg-quick@proton.service 2>/dev/null || true
+ip link delete proton 2>/dev/null || true
+
+echo "=== Start Proton ONLY through systemd ==="
+systemctl daemon-reload
+systemctl enable --now wg-quick@proton.service
+
+sleep 2
+
+wg show proton >/dev/null || {
+    echo "ERROR: Proton WireGuard interface failed to start."
+    systemctl --no-pager status wg-quick@proton.service || true
+    exit 1
+}
+
+echo "=== Create Tailscale -> Proton routing ==="
+
+cat >/usr/local/sbin/tailscale-proton-route <<'SCRIPT'
+#!/bin/bash
+set -e
+
+case "${1:-up}" in
+up)
+
+    # Clean old state
+    nft delete table inet ts_proton 2>/dev/null || true
+    nft delete table ip ts_proton_nat 2>/dev/null || true
+
+    ip rule del fwmark 0x66 table 200 priority 100 2>/dev/null || true
+    ip route flush table 200 2>/dev/null || true
+
+    # Marked packets must use Proton.
+    ip rule add fwmark 0x66 table 200 priority 100
+    ip route add default dev proton table 200
+
+    # Fail closed if Proton routing disappears.
+    ip route add blackhole default table 200 metric 32767
+
+    # Mark internet traffic arriving through Tailscale.
+    nft add table inet ts_proton
+    nft 'add chain inet ts_proton preroute { type filter hook prerouting priority mangle; policy accept; }'
+    nft 'add chain inet ts_proton forward { type filter hook forward priority filter; policy accept; }'
+
+    nft add rule inet ts_proton preroute \
+        iifname "tailscale0" \
+        ip daddr != 100.64.0.0/10 \
+        meta mark set 0x66
+
+    # Prevent IPv6 exit traffic leaking directly through eth0.
+    # Tailscale's own IPv6 tailnet range remains allowed.
+    nft add rule inet ts_proton forward \
+        iifname "tailscale0" \
+        oifname "eth0" \
+        ip6 daddr != fd7a:115c:a1e0::/48 \
+        drop
+
+    # Explicit NAT for traffic leaving Proton.
+    nft add table ip ts_proton_nat
+    nft 'add chain ip ts_proton_nat postrouting { type nat hook postrouting priority srcnat; policy accept; }'
+    nft add rule ip ts_proton_nat postrouting \
+        oifname "proton" \
+        masquerade
+
+    ;;
+
+down)
+
+    nft delete table inet ts_proton 2>/dev/null || true
+    nft delete table ip ts_proton_nat 2>/dev/null || true
+
+    ip rule del fwmark 0x66 table 200 priority 100 2>/dev/null || true
+    ip route flush table 200 2>/dev/null || true
+
+    ;;
+
+*)
+    echo "Usage: $0 up|down"
+    exit 1
+    ;;
+esac
+SCRIPT
+
+chmod 700 /usr/local/sbin/tailscale-proton-route
+
+cat >/etc/systemd/system/tailscale-proton-route.service <<'SERVICE'
+[Unit]
+Description=Route Tailscale exit-node traffic through Proton VPN
+After=network-online.target tailscaled.service wg-quick@proton.service
+Requires=wg-quick@proton.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tailscale-proton-route up
+ExecStop=/usr/local/sbin/tailscale-proton-route down
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+echo "=== Cloudflare DNS-over-TLS ==="
+
+systemctl enable --now systemd-resolved
+
+mkdir -p /etc/systemd/resolved.conf.d
+
+cat >/etc/systemd/resolved.conf.d/cloudflare-dot.conf <<'DNS'
+[Resolve]
+FallbackDNS=
+DNSOverTLS=yes
+Cache=yes
+DNS
+
+ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+
+cat >/etc/systemd/system/proton-dot.service <<'SERVICE'
+[Unit]
+Description=Cloudflare DNS-over-TLS through Proton
+After=wg-quick@proton.service systemd-resolved.service
+Requires=wg-quick@proton.service systemd-resolved.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/resolvectl dns proton 1.1.1.1 1.0.0.1
+ExecStart=/usr/bin/resolvectl domain proton ~.
+ExecStart=/usr/bin/resolvectl dnsovertls proton yes
+ExecStart=/usr/bin/resolvectl flush-caches
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable --now tailscale-proton-route.service
+systemctl enable --now proton-dot.service
+
+echo "=== Configure Tailscale ==="
+
+# Don't let Tailscale overwrite the Linode's resolver.
+tailscale set --accept-dns=false
+
+# Advertise this machine as an exit node.
+tailscale set --advertise-exit-node
+tailscale up
+
+systemctl restart tailscaled
+
+sleep 2
+
+# Reapply routing/DNS after restarting Tailscale.
+systemctl restart tailscale-proton-route.service
+systemctl restart proton-dot.service
+
+echo
+echo "========================================"
+echo " SETUP COMPLETE"
+echo "========================================"
+
+echo
+echo "=== Proton ==="
+wg show proton
+
+echo
+echo "=== Policy routing ==="
+ip rule show
+ip route show table 200
+
+echo
+echo "=== Routing service ==="
+systemctl --no-pager --full status tailscale-proton-route.service || true
+
+echo
+echo "=== DNS over TLS ==="
+resolvectl status proton || true
+
+echo
+echo "=== Tailscale ==="
+tailscale status
+
+echo
+echo "NEXT:"
+echo "Approve this machine as an exit node in the Tailscale Admin Console."
+echo
+EOF
