@@ -1,4 +1,5 @@
-Tails-Up
+Tails-Up, The Easy Tailscale VPN creation script
+
 Instructions, Go to tailcale and create a script for a linux cli connection and enable advertise exit nodes,
 then go to your VPS server and paste the script to install tailscale and connect it to your system. 
 Then go to your vpn provider of choice and download a wireguard config and move it to your servers "/etc/wireguard" folder,
