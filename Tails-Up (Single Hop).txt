@@ -1,0 +1,117 @@
+## Tails-Up (Single Hop)
+## Instructions, Go to tailcale and create a script for a linux cli connection and enable advertise exit nodes then go to your VPS server and paste the script to install tailscale and connect it to your systme then run this script to have the VPS route your traffic acting as your own private VPN with DNS over TLS for encryption
+
+
+sudo bash <<'EOF'
+set -e
+
+echo "=== 1. Enable IP forwarding ==="
+
+cat >/etc/sysctl.d/99-tailscale.conf <<'SYSCTL'
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+SYSCTL
+
+sysctl -p /etc/sysctl.d/99-tailscale.conf
+
+
+echo "=== 2. Configure Fedora firewall/NAT ==="
+
+ETHZONE="$(firewall-cmd --get-zone-of-interface=eth0 2>/dev/null || true)"
+[ -z "$ETHZONE" ] && ETHZONE=public
+
+firewall-cmd --permanent --zone=trusted --add-interface=tailscale0 || true
+firewall-cmd --permanent --zone="$ETHZONE" --add-masquerade
+firewall-cmd --permanent --zone="$ETHZONE" --add-port=41641/udp
+firewall-cmd --reload
+
+
+echo "=== 3. Configure Cloudflare DNS-over-TLS ==="
+
+systemctl enable --now systemd-resolved
+
+mkdir -p /etc/systemd/resolved.conf.d
+
+cat >/etc/systemd/resolved.conf.d/cloudflare-dot.conf <<'DOT'
+[Resolve]
+DNS=1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com
+FallbackDNS=
+DNSOverTLS=yes
+Domains=~.
+Cache=yes
+DOT
+
+ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+
+systemctl restart systemd-resolved
+
+
+echo "=== 4. Make Cloudflare DoT persistent on eth0 ==="
+
+cat >/etc/systemd/system/cloudflare-dot.service <<'SERVICE'
+[Unit]
+Description=Force Cloudflare DNS over TLS
+After=network-online.target NetworkManager.service systemd-resolved.service
+Wants=network-online.target
+Requires=systemd-resolved.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/resolvectl dns eth0 1.1.1.1 1.0.0.1
+ExecStart=/usr/bin/resolvectl domain eth0 ~.
+ExecStart=/usr/bin/resolvectl dnsovertls eth0 yes
+ExecStart=/usr/bin/resolvectl flush-caches
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable --now cloudflare-dot.service
+
+
+echo "=== 5. Configure Tailscale exit node ==="
+
+# Do not let Tailscale replace this server's Cloudflare DNS configuration.
+tailscale set --accept-dns=false
+tailscale set --advertise-exit-node
+tailscale up
+
+systemctl restart tailscaled
+
+# Reapply DoT after Tailscale restart.
+systemctl restart cloudflare-dot.service
+
+
+echo
+echo "=========================================="
+echo " SETUP COMPLETE"
+echo "=========================================="
+echo
+echo "IPv4 forwarding:"
+sysctl net.ipv4.ip_forward
+
+echo
+echo "IPv6 forwarding:"
+sysctl net.ipv6.conf.all.forwarding
+
+echo
+echo "eth0 firewall zone: $ETHZONE"
+
+echo -n "NAT masquerading: "
+firewall-cmd --zone="$ETHZONE" --query-masquerade
+
+echo
+echo "DNS configuration:"
+resolvectl status eth0
+
+echo
+echo "Tailscale:"
+tailscale status
+
+echo
+echo "NEXT:"
+echo "Approve this server as an Exit Node in the Tailscale Admin Console."
+echo
+EOF
